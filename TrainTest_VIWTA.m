@@ -25,6 +25,13 @@ mixing_weights = (1/V.m)*ones(1,V.m);
 
 %% -- Train & Test via VI (Variational Inference) WTA Circuit: --
 % Call Mex Code:
+% Aditya added: I've modified the C++ file -- the hardcoding of data file is removed
+%  So now the neuron spike times must be passed in via below function call
+%  Thus, below function call is obsolete, see my TrainTest_sbatch.py
+%  for the new function call signature from python
+%  Have not modified the Mex function i.e. Matlab bindings in C++
+%  so, first those have to be modified, recompile / re-mex using Matlab,
+%  then change the function call below.
 [W_star, b_star, Converg_avgW, readout_train, readout_test] = ...
       VIWTA_SNN(V.eta_b, V.eta_W, mixing_weights);
 

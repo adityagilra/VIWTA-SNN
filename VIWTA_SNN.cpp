@@ -13,19 +13,25 @@
 //       (This code also outputs the responses during
 //       testing, i.e. frozen using the learned parameters).
 // NOTE: This version is for local use with Matlab (mex file).
-// # of INPUTS:  3
-// # of OUTPUTS: 5
 //
 //  Copyright © 2019 adrianna. All rights reserved.
 //  NOTE: This version has been modified to output
 //        latent mode (i.e. readout neuron spike) probabilities,
 //        to be used as input to LSTM (for Xenesis).
+// Added Python bindings: Aditya Gilra, 2019.
 //_________________________________________________________________
 
 #include "VIWTA_SNN.h"
 
+// Choose either MATLAB or PYTHON to link to via Boost
+//#define MATLAB
+#define PYTHON
+
+
+#ifdef MATLAB
 #include "matrix.h"
 #include "mex.h"
+#endif
 
 #include <iostream>
 #include <fstream>
@@ -39,6 +45,9 @@
 #include <gsl/gsl_rng.h>
 #include <gsl/gsl_randist.h>
 
+// *****************************************************************
+#ifdef MATLAB
+
 template <typename T>
 void writeOutputMatrix(int pos, vector<T> value, int N, int M, mxArray**& plhs) {
     mxArray* out_matrix = mxCreateDoubleMatrix(N,M,mxREAL);
@@ -50,7 +59,6 @@ void writeOutputMatrix(int pos, vector<T> value, int N, int M, mxArray**& plhs) 
     return;
 }
 
-// *****************************************************************
 void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[]) {
     
     // ** Command-Line Argument & Initializations: **
@@ -92,6 +100,149 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[]) {
     writeOutputMatrix(4, readout_test, m, n_timebins, plhs);
     cout << "Finished writing test readout response outputs..." << endl;
 }
+
+#endif
+// *****************************************************************
+
+// *****************************************************************
+#ifdef PYTHON
+
+#include<boost/python.hpp>
+// numpy.hpp needs boost >= 1.63.0, on IST cluster: `module load boost` to get 1.70.0
+#include<boost/python/numpy.hpp>
+
+namespace py = boost::python;
+namespace np = boost::python::numpy;
+
+template <typename T>
+np::ndarray writePyOutputMatrix(vector<T> value, int rows, int cols) {
+// convert C++ vector / 2D vector to a Python numpy array of rows x cols
+// be sure to only pass vector<double> or vector<vector<double>>
+//  since double size is hard-coded below!
+    
+    // https://www.boost.org/doc/libs/1_71_0/libs/python/doc/html/numpy/tutorial/ndarray.html
+    np::dtype dt = np::dtype::get_builtin<double>();    // double hard-coded
+
+    //py::tuple shape = py::make_tuple(value.size());    // size gives only rows
+    py::tuple shape = py::make_tuple(rows,cols);
+
+    //py::tuple stride = py::make_tuple(sizeof(double));
+    //py::object own;
+    // https://www.boost.org/doc/libs/1_71_0/libs/python/doc/html/numpy/tutorial/fromdata.html
+    // from_data uses the same location for both arrays in C and python
+    //np::ndarray arr = np::from_data (value,dt,shape,stride,own);
+    
+    np::ndarray arr = np::zeros(shape, dt);
+    // https://stackoverflow.com/questions/10701514/how-to-return-numpy-array-from-boostpython
+    // double hard-coded
+    std::copy(value.begin(), value.end(), reinterpret_cast<double*>(arr.get_data()));
+    return arr;
+}
+
+vector<double> getVec(np::ndarray arr) {
+    int input_size = arr.shape(0);
+    std::vector<double> v(input_size);
+    for (int i=0; i<input_size; ++i)
+        v[i] = py::extract<double>(arr[i]);
+    return v;
+}
+
+py::list pyWTAcluster(py::list nrnspiketimes, double binsize, int m, double eta_b, double eta_W, int trainiter, np::ndarray & mixWt) {
+    // nrnspiketimes is a list of lists, nNeurons x nSpikeTimes (# of spike times is different for each neuron, so not an array
+    // binsize is the number of samples per bin, @ 10KHz sample rate and a 20ms bin, binsize=200
+    // nbasins is number of modes, around 70 for the data in Prentice et al 2016 for HMM & TreeBasin
+    // eta_b is learning rate for b_k values (hyperparam)
+    // eta_W is learning rate for W_ki values (hyperparam)
+    // m (~ 10) is the number of latent states (# readout neurons)
+    // mixWt is a vector of doubles of length m
+
+    // https://www.boost.org/doc/libs/1_71_0/libs/python/doc/html/reference/index.html
+    // see: https://www.boost.org/doc/libs/1_71_0/libs/python/doc/html/reference/object_wrappers/boost_python_list_hpp.html
+    //cout << py::len(st) << py::extract<double>(st[0]) << endl;
+  
+    cout << "Reading inputs..." << endl;
+    
+    // ** Command-Line Argument & Initializations: **
+    int N = len(nrnspiketimes);  //Afferent neuron population size
+
+    // Load the population spike time data into all_spikes
+    vector<Spike> all_spikes;
+    cout << "Loading in spike time data..." << endl;
+
+    for (int i=0; i<N; i++) {
+        py::list spiketimes = py::extract<py::list>(nrnspiketimes[i]);
+        int nspikes = len(spiketimes);
+        for (int n=0; n<nspikes; n++) {
+            Spike s;
+            s.time = py::extract<double>(spiketimes[n]);    // time units: 1/(10 kHz) typically
+            s.bin  = floor(s.time/binsize);                 // binsize = 200 typically
+            s.neuron_ind = i;
+            all_spikes.push_back(s);
+        }
+    }
+    
+    int lenMixWt = len(mixWt);
+    if (lenMixWt != m) {
+        cout << "Warning: mixWt should have length m" << endl;
+    }
+    vector<double> mixWtVec (lenMixWt);
+    if (lenMixWt>0) {
+        mixWtVec = getVec(mixWt);
+    }
+    
+    string datafile = "ST_VIM_GBPUSD_Daily.txt"; //simulated or actual (data) spike times
+    
+    // ** VI-WTA Spiking Circuit Model **
+    cout << "Initializing VI-WTA object..." << endl;
+    WTACircuitModel WTA_obj(all_spikes, binsize, N, m, eta_b, eta_W, mixWtVec); //instantiate
+    
+    // ** Train on ALL Observed Data & Return Learned Model Params: **
+    cout << "Starting training via STDP update protocol." << endl;
+    paramsStruct<double> learned_W_b = WTA_obj.train_via_STDP(binsize,trainiter);
+    cout << "Finished training via STDP update protocol." << endl;
+
+    py::list outlist = py::list();
+    
+    // ** Return Learned Parameters **
+    vector<double>& learned_W = *learned_W_b.W_star.data();
+    outlist.append(writePyOutputMatrix(learned_W, m, N));
+    outlist.append(writePyOutputMatrix(learned_W_b.b_star, 1, m));
+    int n_timebins = WTA_obj.return_ntimebins();
+    outlist.append(writePyOutputMatrix(learned_W_b.Converg_avgW, 1, learned_W_b.Converg_avgW.size()));
+    cout << "Finished writing learned parameters..." << endl;
+    
+    // ** Return the Readout Responses during *Training* : **
+    vector<double>& readout_training = *learned_W_b.readout.data();
+    outlist.append(writePyOutputMatrix(readout_training, m, n_timebins));
+    
+    // ** Now Test the Trained Network & Return Readout Neuron Responses: **
+    cout << "Beginning testing on data using learned parameters..." << endl;
+    myMatrix<double> output_test = WTA_obj.test_WTA(binsize);
+
+    // ** Return Outputs for Matlab Format: **
+    vector<double>& readout_test = *output_test.data();
+    outlist.append(writePyOutputMatrix(readout_test, m, n_timebins));
+    cout << "Finished writing test readout response outputs..." << endl;
+    
+    return outlist;
+}
+
+void pyInit() {
+    // https://www.boost.org/doc/libs/1_71_0/libs/python/doc/html/numpy/tutorial/simple.html
+    // Initialise the Python runtime, and the numpy module. Failure to call these results in segmentation errors!
+    Py_Initialize();
+    np::initialize();
+    cout << "Initialized python and numpy" << endl;
+}
+
+BOOST_PYTHON_MODULE(VIWTA_SNN)
+{
+   using namespace boost::python;
+   def("pyWTAcluster",pyWTAcluster);
+   def("pyInit",pyInit);
+}
+
+#endif
 // *****************************************************************
 
 // ************************** RNG Methods **************************
@@ -150,7 +301,7 @@ double RNG::gaussian(double sigma, double mu) {
 
 // ******************* WTACircuitModel Methods *********************
 //Constructor:
-WTACircuitModel::WTACircuitModel(const string& filename, double binsize, int N, int m, double eta_b, double eta_W, double* mexArray) : N(N), m(m), eta_b(eta_b), eta_W(eta_W)
+WTACircuitModel::WTACircuitModel(vector<Spike> all_spikes, double binsize, int N, int m, double eta_b, double eta_W, vector<double> v_pre) : N(N), m(m), eta_b(eta_b), eta_W(eta_W)
 {
     rng = new RNG();
     
@@ -159,24 +310,7 @@ WTACircuitModel::WTACircuitModel(const string& filename, double binsize, int N, 
     sigma_w = 2;
     r_net   = 1;      //Units: spikes per *time bin*
     c       = 1;
-    
-    //-- Load the population spike time data from the input filename: --
-    cout << "Loading in spike time data..." << endl;
-    vector<Spike> all_spikes; //Init cache
-    ifstream infile;
-    infile.open(filename);
-    double st;                //Denotes current spike time (10 kHz)
-    int nidx;
-    
-    while( infile >> st >> nidx ) {
-        Spike s;
-        s.time = st;  //Units: 10 kHz
-        s.bin  = floor(s.time/binsize);
-        s.neuron_ind = nidx;
-        all_spikes.push_back(s);
-    }
-    infile.close();
-    
+        
     //-- Now sort spikes to be in chronological order: --
     all_spiketimes = sort_spikes(all_spikes);
     cout << "Sorted spikes..." << endl;       //all_spiketimes is protected data of WTA_obj
@@ -198,10 +332,6 @@ WTACircuitModel::WTACircuitModel(const string& filename, double binsize, int N, 
     W.assign(W_int_vec,m,N);
     
     //-- Load in or initialize m_vec values (constraints): --
-    vector<double> v_pre;
-    for (int k=0; k<m; k++) {
-        v_pre.push_back(mexArray[k]);
-    }
     m_vec = v_pre;
     
     //-- Initialize intrinsic excitabilities, {b_k}: --
@@ -234,13 +364,14 @@ double WTACircuitModel::compute_A_Wk(int k) {
 }
 
 //WTACircuitModel::train_via_STDP
-paramsStruct<double> WTACircuitModel::train_via_STDP(double binsize) {
+paramsStruct<double> WTACircuitModel::train_via_STDP(double binsize, int trainiter) {
     paramsStruct<double> params_learned;
     Spike last_s  = all_spiketimes.back();
     int first_bin = all_spiketimes[0].bin;
     int n_T       = last_s.bin;
     n_timebins    = (n_T-first_bin+1);              //total # of discrete time bins
-    vector<double> Converg_avgW(n_T+1 - first_bin);
+    //vector<double> Converg_avgW(n_T+1 - first_bin);
+    vector<double> Converg_avgW( trainiter * (((int)n_timebins/1000) + 1) );
     
     myMatrix<double> rho_Cache;                     //Initialize cache of outputs during *training*
     vector<double> rho_vec;
@@ -249,50 +380,59 @@ paramsStruct<double> WTACircuitModel::train_via_STDP(double binsize) {
     }
     rho_Cache.assign(rho_vec,m,n_timebins);
     
-    for (int n_t=first_bin; n_t<=n_T; n_t++) {      //n_t denotes the current time bin index
-        //--
-        //std::vector<bool> y(m,0);                 //may later expand scope
-        
-        //(0a) Compute x(n_t) \in \R^N for the current time bin n_t:
-        compute_unweighted_spkvec(n_t, binsize);    //updates vector<double> current_x \in \R^N of WTA_obj
-        
-        //(0b) Compute i(n_t) (which is independent of k)
-        compute_current_inhibition();
-        
-        //double check_homog_netrate = 0; //check that inhibition is implementing homogeneous network rate
-        //if (abs(check_homog_netrate-r_net)>0.001) { cerr << "Non-homogeneous network rate" << endl; }
-        
-        //** Apply STDP Updates: **//
-        //Stochastic E-Step Approximation:
-        for (int k=0; k<m; k++) {
-            // -- Homeostatic Plasticity Step: --
-            double rho_k = compute_rho_k(k);
-            double delta_bk = eta_b * ( m_vec[k] - rho_k);
-            b[k] += delta_bk;
-        } //end over k \in [m]
-        compute_current_inhibition();         //update variational posterior w/ new b_k terms
-        
-        //Stochastic M-Step Approximation:
-        for (int k=0; k<m; k++) {
-            double rho_kt = compute_rho_k(k); //uses updated b_k terms (variational posterior)
-            rho_Cache.assign_entry(k, n_t-first_bin, rho_kt);
+    // Aditya notes: I've added a training iteration loop in case deltaW doesn't convergence in one iteration through data
+    int duoloopcounter = 0;
+    for (int traini = 0; traini<trainiter; traini++) {
+        for (int n_t=first_bin; n_t<=n_T; n_t++) {      //n_t denotes the current time bin index
+            //--
+            //std::vector<bool> y(m,0);                 //may later expand scope
             
-            // -- Update synaptic weights W_ki \forall i \in [N]: --
-            for (int i=0; i<N; i++) {
-                    double deltaW_ki = eta_W * rho_kt * (current_x[i] - (1/(1+exp(-W.at(k,i)))));
-                    deltaW[i*m + k] = deltaW_ki;
-                    W.addto(k, i, deltaW_ki);
-                    //if (W.at(k,i)<0) { cerr << "Negative W_ki obtained for readout neuron " << k << endl; }
-                } //end over i \in [N]
+            //(0a) Compute x(n_t) \in \R^N for the current time bin n_t:
+            compute_unweighted_spkvec(n_t, binsize);    //updates vector<double> current_x \in \R^N of WTA_obj
+            
+            //(0b) Compute i(n_t) (which is independent of k)
+            compute_current_inhibition();
+            
+            //double check_homog_netrate = 0; //check that inhibition is implementing homogeneous network rate
+            //if (abs(check_homog_netrate-r_net)>0.001) { cerr << "Non-homogeneous network rate" << endl; }
+            
+            //** Apply STDP Updates: **//
+            //Stochastic E-Step Approximation:
+            for (int k=0; k<m; k++) {
+                // -- Homeostatic Plasticity Step: --
+                double rho_k = compute_rho_k(k);
+                double delta_bk = eta_b * ( m_vec[k] - rho_k);
+                b[k] += delta_bk;
             } //end over k \in [m]
-        
-        //** To Check Convergence, Compute Mean of \delta W_ik: **
-        Converg_avgW[n_t - first_bin] = calcAvg_deltaW();
-        
-        cout << "Finished n_t = " << n_t << endl;
-        //--
-    } //end over time bins n_t
-    
+            compute_current_inhibition();         //update variational posterior w/ new b_k terms
+            
+            //Stochastic M-Step Approximation:
+            for (int k=0; k<m; k++) {
+                double rho_kt = compute_rho_k(k); //uses updated b_k terms (variational posterior)
+                rho_Cache.assign_entry(k, n_t-first_bin, rho_kt);
+                
+                // -- Update synaptic weights W_ki \forall i \in [N]: --
+                for (int i=0; i<N; i++) {
+                        double deltaW_ki = eta_W * rho_kt * (current_x[i] - (1/(1+exp(-W.at(k,i)))));
+                        deltaW[i*m + k] = deltaW_ki;
+                        W.addto(k, i, deltaW_ki);
+                        //if (W.at(k,i)<0) { cerr << "Negative W_ki obtained for readout neuron " << k << endl; }
+                    } //end over i \in [N]
+                } //end over k \in [m]
+            
+            // Aditya notes: I've moved this as I'm now saving this every 1000 bins
+            ////** To Check Convergence, Compute Mean of \delta W_ik: **
+            //Converg_avgW[n_t - first_bin] = calcAvg_deltaW();
+            
+            if (n_t % 1000 == 0) {
+                cout << "Finished training on bin " << n_t << ", trainiter " << traini << endl;
+                Converg_avgW[duoloopcounter] = calcAvg_deltaW();
+                duoloopcounter++;
+            }
+            //--
+        } //end over time bins n_t
+        cout << "Finished training iteration " << traini << endl;
+    } // end over training iterations
     //Assign learned parameters
     params_learned.W_star = W;
     params_learned.b_star = b;
@@ -406,7 +546,9 @@ myMatrix<double> WTACircuitModel::test_WTA(double binsize) {
             rho_Cache.assign_entry(k, n_t-first_bin, rho_kt);
         } //end over k \in [m] (should now have fully updated vector y(n_t) \in \F_2^N)
         
-        cout << "Finished n_t = " << n_t << endl;
+        if (n_t % 1000 == 0) {
+            cout << "Finished testing on bin " << n_t << endl;
+        }
         //--
     }
     return rho_Cache;

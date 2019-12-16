@@ -140,8 +140,8 @@ public:
 class WTACircuitModel
 {
 public:
-    WTACircuitModel(const string& filename, double binsize, int N, int m, double _etab, double _etaW, double* mx);
-    paramsStruct<double> train_via_STDP(double binsize);
+    WTACircuitModel(vector<Spike> all_spikes, double binsize, int N, int m, double _etab, double _etaW, vector<double> v_pre);
+    paramsStruct<double> train_via_STDP(double binsize, int trainiter);
     myMatrix<double> test_WTA(double binsize);
     int return_ntimebins() { return n_timebins; };
     ~WTACircuitModel();
